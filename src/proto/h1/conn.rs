@@ -509,12 +509,23 @@ where
     fn force_io_read(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         debug_assert!(!self.state.is_read_closed());
 
-        let result = ready!(self.io.poll_read_from_io(cx));
-        Poll::Ready(result.map_err(|e| {
-            trace!(error = %e, "force_io_read; io error");
-            self.state.close();
-            e
-        }))
+        match ready!(self.io.poll_read_from_io(cx)) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(e) => {
+                trace!(error = %e, "force_io_read; io error");
+                // If we got UnexpectedEof and shouldn't error on EOF (i.e., we're idle),
+                // treat it the same as Ok(0). This handles the case where rustls (unlike
+                // OpenSSL) reports an error when the server closes an idle keep-alive
+                // connection with a TCP RST instead of a TLS close_notify alert.
+                if e.kind() == std::io::ErrorKind::UnexpectedEof && !self.should_error_on_eof() {
+                    trace!("force_io_read; treating UnexpectedEof as EOF on idle connection");
+                    Poll::Ready(Ok(0))
+                } else {
+                    self.state.close();
+                    Poll::Ready(Err(e))
+                }
+            }
+        }
     }
 
     fn maybe_notify(&mut self, cx: &mut Context<'_>) {
@@ -555,8 +566,20 @@ where
                     }
                     Poll::Ready(Err(e)) => {
                         trace!("maybe_notify; read_from_io error: {}", e);
-                        self.state.close();
-                        self.state.error = Some(crate::Error::new_io(e));
+                        // If we're idle and got UnexpectedEof, treat it as a clean close.
+                        // This handles the case where rustls (unlike OpenSSL) reports an error
+                        // when the server closes an idle keep-alive connection with a TCP RST
+                        // instead of a TLS close_notify alert. Since no request was in flight,
+                        // this is effectively the same as a clean EOF.
+                        if self.state.is_idle()
+                            && e.kind() == std::io::ErrorKind::UnexpectedEof
+                        {
+                            trace!("maybe_notify; treating UnexpectedEof on idle connection as clean close");
+                            self.state.close();
+                        } else {
+                            self.state.close();
+                            self.state.error = Some(crate::Error::new_io(e));
+                        }
                     }
                 }
             }
