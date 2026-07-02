@@ -510,12 +510,24 @@ where
     fn force_io_read(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         debug_assert!(!self.state.is_read_closed());
 
-        let result = ready!(self.io.poll_read_from_io(cx));
-        Poll::Ready(result.map_err(|e| {
-            trace!(error = %e, "force_io_read; io error");
-            self.state.close();
-            e
-        }))
+        match ready!(self.io.poll_read_from_io(cx)) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            // An unexpected end-of-stream (commonly rustls reporting a peer close without
+            // close_notify, but handled generically for any transport). This func only feeds
+            // require_empty_read and mid_message_detect_eof (message boundaries), never the
+            // body decoder, so treat it as a clean EOF and let their normal handling take
+            // over (idle closes gracefully, in-flight becomes IncompleteMessage). Body
+            // truncation is decoded elsewhere and stays an error.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                trace!("force_io_read; treating UnexpectedEof as EOF");
+                Poll::Ready(Ok(0))
+            }
+            Err(e) => {
+                trace!(error = %e, "force_io_read; io error");
+                self.state.close();
+                Poll::Ready(Err(e))
+            }
+        }
     }
 
     fn maybe_notify(&mut self, cx: &mut Context<'_>) {
@@ -553,6 +565,20 @@ where
                     Poll::Pending => {
                         trace!("maybe_notify; read_from_io blocked");
                         return;
+                    }
+                    Poll::Ready(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // An unexpected end-of-stream on an idle/keep-alive connection
+                        // (commonly rustls reporting a peer close without close_notify, but
+                        // handled generically for any transport). Treat it as a clean EOF so
+                        // the pooled connection closes gracefully and a racing request is
+                        // retried, instead of storing a fatal error that surfaces as
+                        // DispatchGone.
+                        trace!("maybe_notify; treating UnexpectedEof as EOF");
+                        if self.state.is_idle() {
+                            self.state.close();
+                        } else {
+                            self.close_read();
+                        }
                     }
                     Poll::Ready(Err(e)) => {
                         trace!("maybe_notify; read_from_io error: {}", e);

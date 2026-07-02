@@ -3333,3 +3333,81 @@ where
         )
     }
 }
+
+#[tokio::test]
+async fn http1_idle_connection_unexpected_eof_is_graceful() {
+    use std::io::ErrorKind;
+
+    let io = tokio_test::io::Builder::new()
+        .write(b"GET / HTTP/1.1\r\n\r\n")
+        .read(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        .read_error(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "simulated rustls UnexpectedEof on idle connection",
+        ))
+        .build();
+
+    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+        .await
+        .expect("handshake");
+
+    let conn_handle = tokio::spawn(async move { conn.await });
+
+    let req = Request::builder()
+        .uri("/")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let res = client.send_request(req).await.expect("request should succeed");
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let conn_result = tokio::time::timeout(Duration::from_secs(1), conn_handle)
+        .await
+        .expect("timeout")
+        .expect("join");
+
+    assert!(
+        conn_result.is_ok(),
+        "connection should close gracefully on UnexpectedEof while idle, got: {:?}",
+        conn_result
+    );
+}
+
+#[tokio::test]
+async fn http1_unexpected_eof_during_request_returns_incomplete_message() {
+    // UnexpectedEof while a request is in-flight must return IncompleteMessage (retryable),
+    // not a fatal io error that reqwest-retry classifies as Fatal.
+    use std::io::ErrorKind;
+
+    let io = tokio_test::io::Builder::new()
+        .write(b"GET / HTTP/1.1\r\n\r\n")
+        .read_error(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "simulated rustls UnexpectedEof before response",
+        ))
+        .build();
+
+    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+        .await
+        .expect("handshake");
+
+    let conn_handle = tokio::spawn(async move { conn.await });
+
+    let req = Request::builder()
+        .uri("/")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let err = client
+        .send_request(req)
+        .await
+        .expect_err("request should fail");
+
+    assert!(
+        err.is_incomplete_message(),
+        "expected IncompleteMessage for UnexpectedEof during request, got: {:?}",
+        err
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(1), conn_handle).await;
+}

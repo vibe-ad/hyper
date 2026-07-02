@@ -209,7 +209,20 @@ where
                     self.partial_len = None;
                 }
             }
-            if ready!(self.poll_read_from_io(cx)).map_err(crate::Error::new_io)? == 0 {
+            let n = match ready!(self.poll_read_from_io(cx)) {
+                Ok(n) => n,
+                // An unexpected end-of-stream at a message boundary (reading the next
+                // head). Commonly rustls reporting a peer close without close_notify, but
+                // handled generically for any transport: the prior message is complete, so
+                // treat it like a clean EOF and report IncompleteMessage (retryable), as
+                // openssl does, rather than a fatal io error.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    trace!("parse; treating UnexpectedEof as EOF");
+                    0
+                }
+                Err(e) => return Poll::Ready(Err(crate::Error::new_io(e))),
+            };
+            if n == 0 {
                 trace!("parse eof");
                 return Poll::Ready(Err(crate::Error::new_incomplete()));
             }
